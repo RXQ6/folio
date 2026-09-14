@@ -130,8 +130,8 @@ const ALL_FAILURE_MODES: EvaluationFailureMode[] = [
   'resource_unavailable',
 ];
 
-/** Every mode must resolve to one of these; `not-applicable` is status-driven. */
-const EXPECTED_SEVERITY: Record<EvaluationFailureMode, 'pass' | 'partial' | 'fail'> = {
+/** Every mode must resolve to an explicit verdict when it is the only mode. */
+const EXPECTED_VERDICT: Record<EvaluationFailureMode, EvaluationResultRecord['verdict']> = {
   wrong_tool: 'fail',
   missing_tool: 'fail',
   wrong_args: 'fail',
@@ -146,7 +146,7 @@ const EXPECTED_SEVERITY: Record<EvaluationFailureMode, 'pass' | 'partial' | 'fai
   strategy_miss: 'partial',
   timeout: 'fail',
   runtime_error: 'fail',
-  judge_error: 'pass',
+  judge_error: 'not-applicable',
   resource_unavailable: 'partial',
 };
 
@@ -154,11 +154,11 @@ describe('verdictForRun (spec §69)', () => {
   it('classifies every failure mode in the union', () => {
     // Guards the drift that let `judge_error` and `resource_unavailable` sit
     // outside both classification sets and silently return `pass`.
-    expect(Object.keys(EXPECTED_SEVERITY).sort()).toEqual([...ALL_FAILURE_MODES].sort());
+    expect(Object.keys(EXPECTED_VERDICT).sort()).toEqual([...ALL_FAILURE_MODES].sort());
     for (const mode of ALL_FAILURE_MODES) {
       expect([mode, verdictForRun(makeRun({ failureModes: [mode] }))]).toEqual([
         mode,
-        EXPECTED_SEVERITY[mode],
+        EXPECTED_VERDICT[mode],
       ]);
     }
   });
@@ -179,10 +179,15 @@ describe('verdictForRun (spec §69)', () => {
     expect(verdictForRun(makeRun())).toBe('pass');
   });
 
-  it('passes a run whose only failure mode is judge_error', () => {
-    // An evaluation-infrastructure outcome, not an agent failure
-    // (see evaluators/deterministic.ts).
-    expect(verdictForRun(makeRun({ failureModes: ['judge_error'] }))).toBe('pass');
+  it('excludes a run whose only failure mode is judge_error', () => {
+    expect(verdictForRun(makeRun({ failureModes: ['judge_error'] }))).toBe('not-applicable');
+  });
+
+  it('lets real agent failures dominate judge_error regardless of order', () => {
+    expect(verdictForRun(makeRun({ failureModes: ['judge_error', 'missing_tool'] }))).toBe('fail');
+    expect(verdictForRun(makeRun({ failureModes: ['missing_tool', 'judge_error'] }))).toBe('fail');
+    expect(verdictForRun(makeRun({ failureModes: ['judge_error', 'context_miss'] }))).toBe('partial');
+    expect(verdictForRun(makeRun({ failureModes: ['context_miss', 'judge_error'] }))).toBe('partial');
   });
 
   it('is partial for a resource_unavailable run', () => {
@@ -280,6 +285,25 @@ describe('summarizeExperiment', () => {
     expect(summary.passRate).toBe(0.5);
     expect(summary.completedRuns).toBe(3);
     expect(summary.totalRuns).toBe(3);
+  });
+
+  it('excludes a judge-only run from pass rate but still counts judge_error', () => {
+    const judgeRun = makeRun({ failureModes: ['judge_error'] });
+    const results = [
+      makeResult([], { verdict: 'pass' }),
+      makeResult([], { verdict: 'fail' }),
+      makeResult([], {
+        failureModes: judgeRun.failureModes,
+        verdict: verdictForRun(judgeRun),
+      }),
+    ];
+    const summary = summarizeExperiment(experiment, results, cases);
+    expect(summary.passRate).toBe(0.5);
+    expect(summary.failureModes).toContainEqual({
+      mode: 'judge_error',
+      count: 1,
+      sampleCount: 3,
+    });
   });
 
   it('reports a zero pass rate rather than NaN when every run is not-applicable', () => {

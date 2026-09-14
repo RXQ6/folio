@@ -18,7 +18,7 @@ import type {
 } from '@finagent/core';
 import { EVALUATION_METRICS } from '@finagent/core';
 
-type VerdictSeverity = 'fail' | 'partial' | 'pass';
+type FailureModeDisposition = 'fail' | 'partial' | 'not-applicable';
 
 /**
  * Severity of every failure mode. Declared as an exhaustive `Record` over
@@ -28,9 +28,10 @@ type VerdictSeverity = 'fail' | 'partial' | 'pass';
  * `pass` — inflating the pass rate of an experiment that had actually failed.
  *
  * `judge_error` is an evaluation-infrastructure outcome, not an agent failure
- * (see `evaluators/deterministic.ts`), so it never fails a run.
+ * (see `evaluators/deterministic.ts`). A run with only `judge_error` is excluded
+ * from the pass rate, while any real agent failure on the same run still wins.
  */
-const MODE_SEVERITY: Record<EvaluationFailureMode, VerdictSeverity> = {
+const MODE_DISPOSITION: Record<EvaluationFailureMode, FailureModeDisposition> = {
   // Critical: the run itself was wrong.
   wrong_tool: 'fail',
   missing_tool: 'fail',
@@ -48,24 +49,26 @@ const MODE_SEVERITY: Record<EvaluationFailureMode, VerdictSeverity> = {
   context_miss: 'partial',
   strategy_miss: 'partial',
   resource_unavailable: 'partial',
-  // Infrastructure: the judge failed, not the agent.
-  judge_error: 'pass',
+  // Infrastructure: count the judge failure, but exclude a judge-only run.
+  judge_error: 'not-applicable',
 };
 
 /** Verdict per case (spec §69): fail on critical modes, partial otherwise. */
 export function verdictForRun(run: EvaluationRun): EvaluationResultRecord['verdict'] {
   if (run.status === 'skipped') return 'not-applicable';
   if (run.status !== 'completed') return 'fail';
-  let worst: VerdictSeverity = 'pass';
+  let worst: 'pass' | 'partial' = 'pass';
+  let hasJudgeError = false;
   for (const mode of run.failureModes) {
-    const severity: VerdictSeverity | undefined = MODE_SEVERITY[mode];
+    const disposition: FailureModeDisposition | undefined = MODE_DISPOSITION[mode];
     // A mode absent from the table is either a mode added to the union without
     // classification (a compile error, so unreachable) or a record written by a
     // different version. Neither may be silently treated as a pass.
-    if (severity === undefined || severity === 'fail') return 'fail';
-    if (severity === 'partial') worst = 'partial';
+    if (disposition === undefined || disposition === 'fail') return 'fail';
+    if (disposition === 'partial') worst = 'partial';
+    if (disposition === 'not-applicable') hasJudgeError = true;
   }
-  return worst;
+  return worst === 'pass' && hasJudgeError ? 'not-applicable' : worst;
 }
 
 export function aggregateScores(
