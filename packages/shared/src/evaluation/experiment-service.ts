@@ -580,10 +580,14 @@ export class ExperimentService {
         datasetId: dataset.id,
         datasetVersion: dataset.version,
         goldCaseId: caseItem.id,
-        // Trace metadata records the READBACK-confirmed config when available
-        // (#114); requested values are only a fallback label, never proof.
-        model: evalRun.effectiveConfig?.model ?? config.model,
-        provider: evalRun.effectiveConfig?.provider ?? config.provider,
+        // Readback-confirmed values ONLY (#114). A dimension the runtime never
+        // confirmed (no control surface, or recorded as unapplied) stays
+        // unknown in the trace — the requested value is recorded under its own
+        // name and is never promoted to the actual model label.
+        ...(evalRun.effectiveConfig?.model ? { model: evalRun.effectiveConfig.model } : {}),
+        ...(evalRun.effectiveConfig?.provider ? { provider: evalRun.effectiveConfig.provider } : {}),
+        requestedModel: config.model,
+        requestedProvider: config.provider,
       });
       evalRun.traceRef = traceRef;
       // RunManager clears `activeRun` only after all terminal persistence lands
@@ -656,8 +660,15 @@ export class ExperimentService {
       datasetId?: string;
       datasetVersion?: string;
       goldCaseId?: string;
+      /**
+       * Runtime config confirmed by READBACK (#114) — omit the key entirely
+       * when the runtime state is unknown. Never pass a requested value here.
+       */
       model?: string;
       provider?: string;
+      /** Requested values, recorded under their own names (never as actuals). */
+      requestedModel?: string;
+      requestedProvider?: string;
     }
   ): Promise<EvaluationRun['traceRef']> {
     try {
@@ -682,6 +693,8 @@ export class ExperimentService {
             datasetVersion: extras?.datasetVersion,
             model: extras?.model,
             provider: extras?.provider,
+            requestedModel: extras?.requestedModel,
+            requestedProvider: extras?.requestedProvider,
             folioVersion: currentFolioVersion(),
             locale,
           },

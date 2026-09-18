@@ -23,10 +23,12 @@ import type {
   ToolCall,
   ToolCallRecord,
 } from '@finagent/core';
-import { LocalEvaluationBackend } from './backend.ts';
+import { LocalEvaluationBackend, type EvaluationBackend } from './backend.ts';
 import { TraceCorrelationService } from './correlation.ts';
 import { ExperimentService, type ExperimentKernel } from './experiment-service.ts';
 import { createJudgeClient, type JudgeClient } from './judge-client.ts';
+import { normalizeModelSelection } from './model-selection.ts';
+import { LangfuseEvaluationBackend } from './langfuse/backend.ts';
 import { EvaluationStore } from './store.ts';
 import { JsonFileStore } from '../storage/json-file-store.ts';
 
@@ -224,9 +226,9 @@ afterEach(async () => {
   await rm(dir, { recursive: true, force: true });
 });
 
-function createService(kernel: FakeKernel): ExperimentService {
-  const correlation = new TraceCorrelationService({ backend, store });
-  return new ExperimentService({ store, kernel, backend, correlation });
+function createService(kernel: FakeKernel, evalBackend: EvaluationBackend = backend): ExperimentService {
+  const correlation = new TraceCorrelationService({ backend: evalBackend, store });
+  return new ExperimentService({ store, kernel, backend: evalBackend, correlation });
 }
 
 /** Script a healthy quote run for the case id. */
@@ -639,6 +641,97 @@ describe('#114 requested vs effective config', () => {
     expect(runs2[0].status).toBe('failed');
     expect(runs2[0].error?.code).toBe('CONFIG_APPLY_FAILED');
     expect(kernel2.startedRuns).toBe(0);
+  });
+});
+
+describe('#114 CLI model shorthand → runtime control → run metadata', () => {
+  it('splits provider + bare model id at the CLI boundary before the control call', async () => {
+    // What `--model provA/m1` means.
+    expect(normalizeModelSelection('provA/m1')).toEqual({ model: 'm1', provider: 'provA' });
+    // Only the FIRST segment is the provider — model ids may keep further `/`.
+    expect(normalizeModelSelection('openrouter/anthropic/claude-sonnet-4-5')).toEqual({
+      model: 'anthropic/claude-sonnet-4-5',
+      provider: 'openrouter',
+    });
+    expect(normalizeModelSelection('m1')).toEqual({ model: 'm1', provider: undefined });
+    expect(normalizeModelSelection('m1', 'provB')).toEqual({ model: 'm1', provider: 'provB' });
+    // An explicit --provider wins over the prefix.
+    expect(normalizeModelSelection('provA/m1', 'provB')).toEqual({ model: 'm1', provider: 'provB' });
+    // A trailing separator is not a shorthand: left intact for the runtime to reject.
+    expect(normalizeModelSelection('provA/').model).toBe('provA/');
+    expect(normalizeModelSelection('provA/').provider).toBeUndefined();
+
+    const dataset = makeDataset([makeCase('cli-shorthand')]);
+    const kernel = new FakeKernel();
+    scriptSuccess(kernel, 'cli-shorthand');
+    const service = createService(kernel);
+
+    const experiment = await service.runExperiment({
+      dataset,
+      config: makeConfig({ mode: 'live', ...normalizeModelSelection('provA/m1') }),
+    });
+
+    // The control surface receives the bare id — never `provA/provA/m1`.
+    expect(kernel.llmCalls).toContain('setModel:provA/m1');
+    const runs = await store.listRuns(experiment.id);
+    expect(runs[0].effectiveConfig).toMatchObject({ model: 'm1', provider: 'provA' });
+    // Run metadata carries the same normalized pair, not the raw CLI string.
+    expect(experiment.metadata.providerConfiguration).toMatchObject({ model: 'm1', provider: 'provA' });
+  });
+
+  it('labels the trace with the confirmed model only, never with an unapplied request', async () => {
+    const ingests: Array<Array<{ type: string; body: Record<string, unknown> }>> = [];
+    const langfuse = new LangfuseEvaluationBackend({
+      publicKey: 'pk-test',
+      secretKey: 'sk-test',
+      host: 'https://langfuse.test',
+      fetchImpl: async (_input, init) => {
+        const parsed = typeof init?.body === 'string' ? (JSON.parse(init.body) as { batch?: [] }) : {};
+        ingests.push(parsed.batch ?? []);
+        return Response.json({ successes: [], errors: [] });
+      },
+    });
+    const traceMetadata = (): Record<string, unknown> | undefined => {
+      const trace = ingests.flat().find((event) => event.type === 'trace-create');
+      return trace?.body.metadata as Record<string, unknown> | undefined;
+    };
+
+    // No control surface (fixture/local runtime): the request is recorded as a
+    // request, the model that actually ran stays unknown.
+    const kernel = new FakeKernel();
+    kernel.llmEnabled = false;
+    scriptSuccess(kernel, 'trace-unknown');
+    const service = createService(kernel, langfuse);
+    const experiment = await service.runExperiment({
+      dataset: makeDataset([makeCase('trace-unknown')]),
+      config: makeConfig({ mode: 'fixture', ...normalizeModelSelection('provA/m1') }),
+    });
+
+    const runs = await store.listRuns(experiment.id);
+    expect(runs[0].effectiveConfig?.model).toBeUndefined();
+    const unknownMeta = traceMetadata();
+    expect(unknownMeta?.requestedModel).toBe('m1');
+    expect(unknownMeta?.requestedProvider).toBe('provA');
+    // Never promoted to an actual label…
+    expect(unknownMeta).not.toHaveProperty('model');
+    expect(unknownMeta).not.toHaveProperty('provider');
+    // …and no generation span claims a model either.
+    expect(ingests.flat().some((event) => event.type === 'generation-create')).toBe(false);
+
+    // Readback confirmed: the trace carries the effective pair under its own key.
+    ingests.length = 0;
+    const liveKernel = new FakeKernel();
+    scriptSuccess(liveKernel, 'trace-confirmed');
+    const liveService = createService(liveKernel, langfuse);
+    await liveService.runExperiment({
+      dataset: makeDataset([makeCase('trace-confirmed')]),
+      config: makeConfig({ mode: 'live', ...normalizeModelSelection('provA/m1') }),
+    });
+
+    const confirmedMeta = traceMetadata();
+    expect(confirmedMeta?.model).toBe('m1');
+    expect(confirmedMeta?.provider).toBe('provA');
+    expect(confirmedMeta?.requestedModel).toBe('m1');
   });
 });
 

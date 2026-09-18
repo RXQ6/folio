@@ -28,6 +28,7 @@ import { LocalEvaluationBackend, resolveBackend } from '../../packages/shared/sr
 import { resolveLangfuseBackend } from '../../packages/shared/src/evaluation/langfuse/resolve.ts';
 import { TraceCorrelationService } from '../../packages/shared/src/evaluation/correlation.ts';
 import { createJudgeClient, resolveJudgeConfig } from '../../packages/shared/src/evaluation/judge-client.ts';
+import { normalizeModelSelection } from '../../packages/shared/src/evaluation/model-selection.ts';
 import { embeddedDatasets } from '../../packages/shared/src/evaluation/datasets/index.ts';
 import { validateGoldCaseDataset } from '../../packages/core/src/evaluation.ts';
 import {
@@ -75,7 +76,8 @@ const USAGE = `Usage:
 Flags:
   --dataset <id>          Embedded dataset id (default: folio-agent-v1)
   --mode fixture|live     Runtime mode (default: fixture)
-  --model <id>            Agent model under test (e.g. anthropic/claude-sonnet-4-5)
+  --model <id>            Agent model under test (e.g. anthropic/claude-sonnet-4-5;
+                          a provider prefix is split off and applied via setModel)
   --provider <id>         Agent provider override
   --thinking <level>      Thinking level to apply to the runtime (live mode)
   --strategy <id>         Strategy/skill id to load into the runtime
@@ -791,10 +793,16 @@ async function main(): Promise<number> {
 
     const correlation = new TraceCorrelationService({ backend, store });
     const service = new ExperimentService({ store, kernel, backend, correlation });
+    // `--model provider/model-id` is a CLI shorthand: split it into the two
+    // dimensions the runtime control surface takes (setModel(provider, id))
+    // BEFORE anything touches ExperimentConfig — the prefixed id must never
+    // reach the runtime or the run metadata (#114; the same normalization
+    // #122 needs, kept in one place).
+    const selection = normalizeModelSelection(options.model, options.provider);
     const config: ExperimentConfig = {
       mode: options.mode,
-      model: options.model,
-      provider: options.provider,
+      model: selection.model,
+      provider: selection.provider,
       thinkingLevel: options.thinking,
       strategyId: options.strategy,
       judgeModel: options.judgeModel ?? judgeConfig?.model,
@@ -802,10 +810,6 @@ async function main(): Promise<number> {
       maxCases: options.maxCases,
       timeoutMs: options.timeoutMs,
     };
-    // A `--model provider/model` shorthand implies the provider.
-    if (config.model && !config.provider && config.model.includes('/')) {
-      config.provider = config.model.split('/')[0];
-    }
 
     const storeBaseline = options.baseline
       ? (await store.listBaselines()).find((entry) => entry.id === options.baseline) ??
